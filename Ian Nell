@@ -1,0 +1,242 @@
+import cv2
+import numpy as np
+from sklearn.linear_model import RANSACRegressor
+from ultralytics import YOLO
+from collections import deque
+
+# Global constants
+MIN_ROAD_WIDTH = 150
+OFF_CENTER_THRESHOLD = 40
+LATERAL_MOVEMENT_THRESHOLD = 0.7
+IMPAIRED_MOVEMENT_THRESHOLD = 5
+CENTER_THRESHOLD = 37
+LATERAL_HISTORY_LENGTH = 200
+OSCILLATION_FRAME_LENGTH = 200
+
+classes_of_interest = {0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorbike', 7: 'truck'}
+object_tracks = {}
+model = YOLO('yolov8n.pt')
+
+previous_left_lane = None
+previous_right_lane = None
+previous_lane_center_fit = None
+
+
+def detect_lanes(frame, vehicle_boxes):
+    global previous_left_lane, previous_right_lane, previous_lane_center_fit
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    adaptive_thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+    edges = cv2.Canny(adaptive_thresh, 30, 100)
+
+    height, width = frame.shape[:2]
+    mask = np.zeros_like(edges)
+    roi = np.array([[(400, 800), (850, 560), (1000, 560), (1380, 800)]], dtype=np.int32)
+    cv2.fillPoly(mask, [roi], 255)
+
+    for (vx1, vy1, vx2, vy2) in vehicle_boxes:
+        cv2.rectangle(mask, (vx1, vy1), (vx2, vy2), 0, thickness=-1)
+
+    masked_edges = cv2.bitwise_and(edges, mask)
+
+    lines = cv2.HoughLinesP(masked_edges, 1, np.pi / 180, 30, minLineLength=30, maxLineGap=100)
+    lane_overlay = np.zeros_like(frame)
+    left_lane_points = []
+    right_lane_points = []
+
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            slope = (y2 - y1) / (x2 - x1 + 1e-6)
+            if abs(slope) > 0.3:
+                if slope < 0:
+                    left_lane_points.extend([(x1, y1), (x2, y2)])
+                else:
+                    right_lane_points.extend([(x1, y1), (x2, y2)])
+
+    def fit_lane(points, degree=2):
+        if len(points) > 10:
+            points = np.array(points)
+            y_vals = points[:, 1].reshape(-1, 1)
+            x_vals = points[:, 0]
+            ransac = RANSACRegressor()
+            ransac.fit(y_vals, x_vals)
+            return np.polyfit(y_vals.flatten(), ransac.predict(y_vals), degree)
+        return None
+
+    left_fit = fit_lane(left_lane_points)
+    right_fit = fit_lane(right_lane_points)
+    lane_center_fit = previous_lane_center_fit
+
+    if left_fit is not None and right_fit is not None:
+        lane_center_fit = (left_fit + right_fit) / 2
+    elif previous_lane_center_fit is not None:
+        lane_center_fit = previous_lane_center_fit
+    elif right_fit is not None:
+        lane_center_fit = right_fit - np.array([0, width // 4, 0])
+    elif left_fit is not None:
+        lane_center_fit = left_fit + np.array([0, width // 3, 0])
+    else:
+        lane_center_fit = None
+
+    if previous_lane_center_fit is not None and lane_center_fit is not None and (left_fit is not None and right_fit is not None):
+        lane_center_fit = 0.9 * previous_lane_center_fit + 0.1 * lane_center_fit
+    if lane_center_fit is not None:
+        previous_lane_center_fit = lane_center_fit
+
+    cv2.polylines(lane_overlay, [roi], True, (0, 255, 255), 3)
+
+    for y in range(600, height, 5):
+        if left_fit is not None:
+            x_left = int(np.polyval(left_fit, y))
+            cv2.circle(lane_overlay, (x_left, y), 3, (255, 0, 0), -1)
+        if right_fit is not None:
+            x_right = int(np.polyval(right_fit, y))
+            cv2.circle(lane_overlay, (x_right, y), 3, (0, 0, 255), -1)
+        if lane_center_fit is not None:
+            x_center = int(np.polyval(lane_center_fit, y))
+            cv2.circle(lane_overlay, (x_center, y), 3, (0, 255, 0), -1)
+
+    return lane_overlay, lane_center_fit
+
+
+def detect_oscillation(lateral_vals):
+    signs = [np.sign(v) for v in lateral_vals if abs(v) > IMPAIRED_MOVEMENT_THRESHOLD]
+    sign_changes = sum(1 for i in range(1, len(signs)) if signs[i] != signs[i - 1])
+    return sign_changes >= 3
+
+
+def process_frame(frame):
+    height, width = frame.shape[:2]
+    bottom_limit = 0.8 * height
+    roi = np.array([[(400, 800), (850, 560), (1000, 560), (1380, 800)]], dtype=np.int32)
+
+    lane_overlay, lane_center_fit = detect_lanes(frame, [])
+    results = model.predict(source=frame, stream=True)
+
+    global object_tracks, next_object_id
+    if 'next_object_id' not in globals():
+        next_object_id = 0
+
+    for result in results:
+        for box in result.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            cls_id = int(box.cls[0])
+            if cls_id not in classes_of_interest:
+                continue
+
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            if cy > bottom_limit:
+                continue
+
+            in_roi = cv2.pointPolygonTest(roi, (cx, cy), False) >= 0
+
+            matched_id = None
+            for obj_id, track in object_tracks.items():
+                if track['cls_id'] == cls_id:
+                    prev_center = track['center']
+                    dist = np.hypot(cx - prev_center[0], cy - prev_center[1])
+                    if dist < 50:
+                        matched_id = obj_id
+                        break
+
+            if matched_id is None:
+                matched_id = next_object_id
+                next_object_id += 1
+                object_tracks[matched_id] = {
+                    'cls_id': cls_id,
+                    'center': (cx, cy),
+                    'lateral_history': deque(maxlen=LATERAL_HISTORY_LENGTH),
+                    'area_history': deque(maxlen=5)
+                }
+
+            track = object_tracks[matched_id]
+            lateral_disp = track['center'][0] - cx
+            track['lateral_history'].append(lateral_disp)
+            track['center'] = (cx, cy)
+
+            avg_lateral = np.mean(track['lateral_history']) if track['lateral_history'] else 0
+
+            if lane_center_fit is not None:
+                lane_center_x = int(np.polyval(lane_center_fit, cy))
+                off_center = abs(cx - lane_center_x)
+                cv2.circle(frame, (lane_center_x, cy), 5, (0, 255, 255), -1)
+            else:
+                off_center = 0
+
+            current_area = (x2 - x1) * (y2 - y1)
+            track['area_history'].append(current_area)
+
+            if len(track['area_history']) == 5:
+                diffs = np.diff(track['area_history'])
+                if all(d > 0 for d in diffs):
+                    direction = "Approaching"
+                elif all(d < 0 for d in diffs):
+                    direction = "Receding"
+                else:
+                    direction = "Steady"
+            else:
+                direction = "Steady"
+
+            alarms = []
+            if in_roi:
+                if abs(avg_lateral) > LATERAL_MOVEMENT_THRESHOLD and off_center > OFF_CENTER_THRESHOLD:
+                    alarms.append("DISTRACTED DRIVER AHEAD")
+                if detect_oscillation(list(track['lateral_history'])):
+                    alarms.append("IMPAIRED DRIVER AHEAD")
+
+            color = (0, 0, 255) if alarms else (255, 0, 0)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.circle(frame, (cx, cy), 5, (0, 255, 0), -1)
+
+            y_text = y2 + 20
+            for text in [
+                f"Class: {classes_of_interest[cls_id]}",
+                f"Lateral: {avg_lateral:.2f}",
+                f"OffCenter: {off_center}",
+                f"Direction: {direction}"
+            ]:
+                cv2.putText(frame, text, (x1, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+                y_text += 15
+
+            for alarm in alarms:
+                cv2.putText(frame, alarm, (x1, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                y_text += 15
+
+
+
+    return cv2.addWeighted(frame, 0.8, lane_overlay, 0.4, 0)
+
+
+def process_video(input_video, output_video):
+    global next_object_id
+    next_object_id = 0
+    cap = cv2.VideoCapture(input_video)
+    if not cap.isOpened():
+        print("Error opening video file")
+        return
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out = cv2.VideoWriter(output_video, cv2.VideoWriter_fourcc(*'XVID'), fps, (width, height))
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        output_frame = process_frame(frame)
+        out.write(output_frame)
+        cv2.imshow("Final Output", output_frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    out.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    process_video('GRMN0027.MP4', 'final_output.avi')
