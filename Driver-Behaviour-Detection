@@ -19,11 +19,11 @@ model = YOLO('yolov8n.pt')
 
 previous_left_lane = None
 previous_right_lane = None
-previous_lane_center_fit = None
+previous_lane_centre_fit = None
 
 
 def detect_lanes(frame, vehicle_boxes):
-    global previous_left_lane, previous_right_lane, previous_lane_center_fit
+    global previous_left_lane, previous_right_lane, previous_lane_centre_fit
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -67,23 +67,23 @@ def detect_lanes(frame, vehicle_boxes):
 
     left_fit = fit_lane(left_lane_points)
     right_fit = fit_lane(right_lane_points)
-    lane_center_fit = previous_lane_center_fit
+    lane_centre_fit = previous_lane_centre_fit
 
     if left_fit is not None and right_fit is not None:
-        lane_center_fit = (left_fit + right_fit) / 2
-    elif previous_lane_center_fit is not None:
-        lane_center_fit = previous_lane_center_fit
+        lane_centre_fit = (left_fit + right_fit) / 2
+    elif previous_lane_centre_fit is not None:
+        lane_centre_fit = previous_lane_centre_fit
     elif right_fit is not None:
-        lane_center_fit = right_fit - np.array([0, width // 4, 0])
+        lane_centre_fit = right_fit - np.array([0, width // 4, 0])
     elif left_fit is not None:
-        lane_center_fit = left_fit + np.array([0, width // 3, 0])
+        lane_centre_fit = left_fit + np.array([0, width // 3, 0])
     else:
-        lane_center_fit = None
+        lane_centre_fit = None
 
-    if previous_lane_center_fit is not None and lane_center_fit is not None and (left_fit is not None and right_fit is not None):
-        lane_center_fit = 0.9 * previous_lane_center_fit + 0.1 * lane_center_fit
-    if lane_center_fit is not None:
-        previous_lane_center_fit = lane_center_fit
+    if previous_lane_centre_fit is not None and lane_centre_fit is not None and (left_fit is not None and right_fit is not None):
+        lane_centre_fit = 0.9 * previous_lane_centre_fit + 0.1 * lane_centre_fit
+    if lane_centre_fit is not None:
+        previous_lane_centre_fit = lane_centre_fit
 
     cv2.polylines(lane_overlay, [roi], True, (0, 255, 255), 3)
 
@@ -94,11 +94,11 @@ def detect_lanes(frame, vehicle_boxes):
         if right_fit is not None:
             x_right = int(np.polyval(right_fit, y))
             cv2.circle(lane_overlay, (x_right, y), 3, (0, 0, 255), -1)
-        if lane_center_fit is not None:
-            x_center = int(np.polyval(lane_center_fit, y))
-            cv2.circle(lane_overlay, (x_center, y), 3, (0, 255, 0), -1)
+        if lane_centre_fit is not None:
+            x_centre = int(np.polyval(lane_centre_fit, y))
+            cv2.circle(lane_overlay, (x_centre, y), 3, (0, 255, 0), -1)
 
-    return lane_overlay, lane_center_fit
+    return lane_overlay, lane_centre_fit
 
 
 def detect_oscillation(lateral_vals):
@@ -112,7 +112,7 @@ def process_frame(frame):
     bottom_limit = 0.8 * height
     roi = np.array([[(400, 800), (850, 560), (1000, 560), (1380, 800)]], dtype=np.int32)
 
-    lane_overlay, lane_center_fit = detect_lanes(frame, [])
+    lane_overlay, lane_centre_fit = detect_lanes(frame, [])
     results = model.predict(source=frame, stream=True)
 
     global object_tracks, next_object_id
@@ -135,8 +135,8 @@ def process_frame(frame):
             matched_id = None
             for obj_id, track in object_tracks.items():
                 if track['cls_id'] == cls_id:
-                    prev_center = track['center']
-                    dist = np.hypot(cx - prev_center[0], cy - prev_center[1])
+                    prev_centre = track['centre']
+                    dist = np.hypot(cx - prev_centre[0], cy - prev_centre[1])
                     if dist < 50:
                         matched_id = obj_id
                         break
@@ -146,24 +146,24 @@ def process_frame(frame):
                 next_object_id += 1
                 object_tracks[matched_id] = {
                     'cls_id': cls_id,
-                    'center': (cx, cy),
+                    'centre': (cx, cy),
                     'lateral_history': deque(maxlen=LATERAL_HISTORY_LENGTH),
                     'area_history': deque(maxlen=5)
                 }
 
             track = object_tracks[matched_id]
-            lateral_disp = track['center'][0] - cx
+            lateral_disp = track['centre'][0] - cx
             track['lateral_history'].append(lateral_disp)
-            track['center'] = (cx, cy)
+            track['centre'] = (cx, cy)
 
             avg_lateral = np.mean(track['lateral_history']) if track['lateral_history'] else 0
 
-            if lane_center_fit is not None:
-                lane_center_x = int(np.polyval(lane_center_fit, cy))
-                off_center = abs(cx - lane_center_x)
-                cv2.circle(frame, (lane_center_x, cy), 5, (0, 255, 255), -1)
+            if lane_centre_fit is not None:
+                lane_centre_x = int(np.polyval(lane_centre_fit, cy))
+                off_centre = abs(cx - lane_centre_x)
+                cv2.circle(frame, (lane_centre_x, cy), 5, (0, 255, 255), -1)
             else:
-                off_center = 0
+                off_centre = 0
 
             current_area = (x2 - x1) * (y2 - y1)
             track['area_history'].append(current_area)
@@ -181,7 +181,7 @@ def process_frame(frame):
 
             alarms = []
             if in_roi:
-                if abs(avg_lateral) > LATERAL_MOVEMENT_THRESHOLD and off_center > OFF_CENTER_THRESHOLD:
+                if abs(avg_lateral) > LATERAL_MOVEMENT_THRESHOLD and off_centre > OFF_CENTER_THRESHOLD:
                     alarms.append("DISTRACTED DRIVER AHEAD")
                 if detect_oscillation(list(track['lateral_history'])):
                     alarms.append("IMPAIRED DRIVER AHEAD")
@@ -194,7 +194,7 @@ def process_frame(frame):
             for text in [
                 f"Class: {classes_of_interest[cls_id]}",
                 f"Lateral: {avg_lateral:.2f}",
-                f"OffCenter: {off_center}",
+                f"OffCentre: {off_centre}",
                 f"Direction: {direction}"
             ]:
                 cv2.putText(frame, text, (x1, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
@@ -239,4 +239,4 @@ def process_video(input_video, output_video):
 
 
 if __name__ == "__main__":
-    process_video('GRMN0027.MP4', 'final_output.avi')
+    process_video('GRMN4535.MP4', 'final_output.avi')
