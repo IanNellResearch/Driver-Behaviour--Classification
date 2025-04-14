@@ -1,17 +1,15 @@
 import cv2
 import numpy as np
+from collections import deque
 from sklearn.linear_model import RANSACRegressor
 from ultralytics import YOLO
-from collections import deque
 
 # Global constants
-MIN_ROAD_WIDTH = 150
 OFF_CENTER_THRESHOLD = 40
-LATERAL_MOVEMENT_THRESHOLD = 0.7
-IMPAIRED_MOVEMENT_THRESHOLD = 5
-CENTER_THRESHOLD = 37
-LATERAL_HISTORY_LENGTH = 200
-OSCILLATION_FRAME_LENGTH = 200
+LATERAL_MOVEMENT_THRESHOLD = 0.3
+IMPAIRED_MOVEMENT_THRESHOLD = 0.6
+LATERAL_HISTORY_LENGTH = 60  # Period (e.g., 2–3 seconds)
+SIGN_CHANGE_LATCH_THRESHOLD = 3  # Number of sign changes to trigger alarm
 
 classes_of_interest = {0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorbike', 7: 'truck'}
 object_tracks = {}
@@ -21,13 +19,13 @@ previous_left_lane = None
 previous_right_lane = None
 previous_lane_centre_fit = None
 
-
 def detect_lanes(frame, vehicle_boxes):
     global previous_left_lane, previous_right_lane, previous_lane_centre_fit
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    adaptive_thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+    adaptive_thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                              cv2.THRESH_BINARY, 11, 2)
     edges = cv2.Canny(adaptive_thresh, 30, 100)
 
     height, width = frame.shape[:2]
@@ -39,7 +37,6 @@ def detect_lanes(frame, vehicle_boxes):
         cv2.rectangle(mask, (vx1, vy1), (vx2, vy2), 0, thickness=-1)
 
     masked_edges = cv2.bitwise_and(edges, mask)
-
     lines = cv2.HoughLinesP(masked_edges, 1, np.pi / 180, 30, minLineLength=30, maxLineGap=100)
     lane_overlay = np.zeros_like(frame)
     left_lane_points = []
@@ -100,13 +97,6 @@ def detect_lanes(frame, vehicle_boxes):
 
     return lane_overlay, lane_centre_fit
 
-
-def detect_oscillation(lateral_vals):
-    signs = [np.sign(v) for v in lateral_vals if abs(v) > IMPAIRED_MOVEMENT_THRESHOLD]
-    sign_changes = sum(1 for i in range(1, len(signs)) if signs[i] != signs[i - 1])
-    return sign_changes >= 3
-
-
 def process_frame(frame):
     height, width = frame.shape[:2]
     bottom_limit = 0.8 * height
@@ -148,20 +138,43 @@ def process_frame(frame):
                     'cls_id': cls_id,
                     'centre': (cx, cy),
                     'lateral_history': deque(maxlen=LATERAL_HISTORY_LENGTH),
-                    'area_history': deque(maxlen=5)
+                    'ave_lateral_history': deque(maxlen=LATERAL_HISTORY_LENGTH),
+                    'area_history': deque(maxlen=5),
+                    'sign_change_latch': 0,
+                    'last_sign': None
                 }
 
             track = object_tracks[matched_id]
+            # Calculate lateral displacement as the difference in x-coordinates.
             lateral_disp = track['centre'][0] - cx
             track['lateral_history'].append(lateral_disp)
             track['centre'] = (cx, cy)
 
+            # Compute current average lateral movement from individual lateral displacements.
             avg_lateral = np.mean(track['lateral_history']) if track['lateral_history'] else 0
+            # Append the computed average to the average lateral history.
+            track['ave_lateral_history'].append(avg_lateral)
+
+            # Determine current sign
+            current_sign = np.sign(avg_lateral)
+
+            # Check for sign change
+            if track['last_sign'] is not None and current_sign != 0 and current_sign != track['last_sign']:
+                track['sign_change_latch'] += 1
+            elif len(track['ave_lateral_history']) == LATERAL_HISTORY_LENGTH:
+                # Reset latch if no sign change in the entire history
+                signs = [np.sign(val) for val in track['ave_lateral_history']]
+                if all(s == signs[0] for s in signs):
+                    track['sign_change_latch'] = 0
+
+            # Update last_sign
+            if current_sign != 0:
+                track['last_sign'] = current_sign
 
             if lane_centre_fit is not None:
                 lane_centre_x = int(np.polyval(lane_centre_fit, cy))
                 off_centre = abs(cx - lane_centre_x)
-                cv2.circle(frame, (lane_centre_x, cy), 5, (0, 255, 255), -1)
+                cv2.circle(frame, (lane_centre_x, cy), 5, (0, 255, 0), -1)
             else:
                 off_centre = 0
 
@@ -183,17 +196,18 @@ def process_frame(frame):
             if in_roi:
                 if abs(avg_lateral) > LATERAL_MOVEMENT_THRESHOLD and off_centre > OFF_CENTER_THRESHOLD:
                     alarms.append("DISTRACTED DRIVER AHEAD")
-                if detect_oscillation(list(track['lateral_history'])):
+                # Now use the average lateral history for oscillation detection.
+                if track['sign_change_latch'] >= SIGN_CHANGE_LATCH_THRESHOLD:
                     alarms.append("IMPAIRED DRIVER AHEAD")
 
             color = (0, 0, 255) if alarms else (255, 0, 0)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.circle(frame, (cx, cy), 5, (0, 255, 0), -1)
+            cv2.circle(frame, (cx, cy), 5, (0, 255, 255), -1)
 
             y_text = y2 + 20
             for text in [
                 f"Class: {classes_of_interest[cls_id]}",
-                f"Lateral: {avg_lateral:.2f}",
+                f"AvgLateral: {avg_lateral:.2f}",
                 f"OffCentre: {off_centre}",
                 f"Direction: {direction}"
             ]:
@@ -204,10 +218,32 @@ def process_frame(frame):
                 cv2.putText(frame, alarm, (x1, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
                 y_text += 15
 
+          
+            # (Optional) Display the latest 20 average lateral movements in blue below the box.
 
+            y_text += 20
+
+            if in_roi:
+                sign_changes = track['sign_change_latch']
+
+                # Set text color based on the number of sign changes.
+                if sign_changes == 0:
+                    text_color = (255, 0, 0)  # Blue for 0 sign changes.
+                elif sign_changes == 1:
+                    text_color = (0, 255, 0)  # Green for 1 sign change.
+                elif sign_changes == 2:
+                    text_color = (0, 255, 255)  # Yellow for 2 sign changes.
+                elif sign_changes >= 3:
+                    text_color = (0, 0, 255)  # Red for 3 or more sign changes.
+                else:
+                    text_color = (255, 0, 0)  # Or whatever default you want (black, gray, etc.)
+
+                for i, avg_lat in enumerate(reversed(track['ave_lateral_history'])):
+                    cv2.putText(frame, f"AvgLat {20 - i}: {avg_lat:.2f}", (x1, y_text),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1)
+                    y_text += 15
 
     return cv2.addWeighted(frame, 0.8, lane_overlay, 0.4, 0)
-
 
 def process_video(input_video, output_video):
     global next_object_id
@@ -237,6 +273,5 @@ def process_video(input_video, output_video):
     out.release()
     cv2.destroyAllWindows()
 
-
 if __name__ == "__main__":
-    process_video('GRMN4535.MP4', 'final_output.avi')
+    process_video('GRMN4534.MP4', 'final_output.avi')
