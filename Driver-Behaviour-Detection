@@ -129,7 +129,7 @@ def process_frame(frame, frame_count):
     - Triggers alerts for distracted or impaired driving
     """
     height, width = frame.shape[:2]
-    cv2.putText(frame, f"Frame: {frame_count}", (frame.shape[1] - 200, 30),
+    cv2.putText(frame, f"Frame: {frame_count}", (1150, 790),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
     bottom_limit = 0.8 * height
     roi = np.array([[(400, 800), (850, 560), (1000, 560), (1380, 800)]], dtype=np.int32)
