@@ -1,4 +1,5 @@
-import cv2 
+import cv2
+import csv
 import numpy as np
 from collections import deque
 from sklearn.linear_model import RANSACRegressor
@@ -120,7 +121,7 @@ def detect_lanes(frame, vehicle_boxes):
 
     return lane_overlay, lane_centre_fit
 
-def process_frame(frame):
+def process_frame(frame, frame_count):
     """
     Processes a single video frame:
     - Detects objects and lane lines
@@ -128,6 +129,8 @@ def process_frame(frame):
     - Triggers alerts for distracted or impaired driving
     """
     height, width = frame.shape[:2]
+    cv2.putText(frame, f"Frame: {frame_count}", (frame.shape[1] - 200, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
     bottom_limit = 0.8 * height
     roi = np.array([[(400, 800), (850, 560), (1000, 560), (1380, 800)]], dtype=np.int32)
 
@@ -238,9 +241,12 @@ def process_frame(frame):
                 cv2.putText(frame, text, (x1, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
                 y_text += 15
 
+            
             for alarm in alarms:
                 cv2.putText(frame, alarm, (x1, y_text), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
                 y_text += 15
+
+            y_text += 10  # Gap before alarms
 
             # Optional: Display lateral movement history
             if in_roi:
@@ -278,23 +284,92 @@ def process_video(input_video, output_video):
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    out = cv2.VideoWriter(output_video, VideoWriter_fourcc (*'XVID'), fps, (width, height))
+    out = cv2.VideoWriter(output_video, cv2.VideoWriter_fourcc(*'XVID'), fps, (width, height))
+
+    frame_count = 0
+    csv_data = []  # Initialize list to store CSV rows
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        output_frame = process_frame(frame)
+        output_frame = process_frame(frame, frame_count)
         out.write(output_frame)
+
+        # Collect data per object in the current frame
+        for obj_id, track in object_tracks.items():
+            cx, cy = track['centre']
+            cls_id = track['cls_id']
+            avg_lateral = np.mean(track['lateral_history']) if track['lateral_history'] else 0
+            lane_centre_x = int(
+                np.polyval(previous_lane_centre_fit, cy)) if previous_lane_centre_fit is not None else cx
+            off_centre = abs(cx - lane_centre_x)
+
+            # Define the same ROI polygon
+            roi_polygon = np.array([[400, 800], [850, 560], [1000, 560], [1380, 800]], np.int32)
+            in_roi = cv2.pointPolygonTest(roi_polygon, (cx, cy), False) >= 0
+
+            # Skip logging if object not in ROI
+            if not in_roi:
+                continue
+
+            alarms = []
+            impaired_logged = False
+
+            if abs(avg_lateral) > LATERAL_MOVEMENT_THRESHOLD and off_centre > OFF_CENTRE_THRESHOLD:
+                alarms.append("DISTRACTED DRIVER AHEAD")
+            if track['sign_change_latch'] >= SIGN_CHANGE_LATCH_THRESHOLD:
+                alarms.append("IMPAIRED DRIVER AHEAD")
+                impaired_logged = True
+
+            direction = "Unknown"
+            if len(track['area_history']) == 5:
+                diffs = np.diff(track['area_history'])
+                if all(d > 0 for d in diffs):
+                    direction = "Approaching"
+                elif all(d < 0 for d in diffs):
+                    direction = "Receding"
+                else:
+                    direction = "Steady"
+
+            csv_data.append([
+                frame_count,
+                obj_id,
+                classes_of_interest.get(cls_id, "Unknown"),
+                cx,
+                cy,
+                f"{avg_lateral:.2f}",
+                off_centre,
+                direction,
+                track['sign_change_latch'],
+                ";".join(alarms),
+                "SIGN CHANGE BEFORE ALARM" if impaired_logged else ""
+            ])
+
+        frame_count += 1
         cv2.imshow("Final Output", output_frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
+
+    # Write the collected data to CSV
+    with open("driver_alerts_log.csv", mode="w", newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow([
+            "Frame", "ObjectID", "Class", "CX", "CY",
+            "AvgLateral", "OffCentre", "Direction",
+            "SignChangeLatch", "Alarms", "SignChangeInfo"
+        ])
+
+        writer.writerows(csv_data)
+
+    print("CSV file saved as: driver_alerts_log.csv")
 
     cap.release()
     out.release()
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    process_video('GRMN4535.MP4', 'final_output.avi')
+    process_video('GRMN0025.MP4', 'final_output.avi')
 
+    
